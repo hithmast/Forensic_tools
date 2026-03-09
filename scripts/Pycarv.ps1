@@ -41,6 +41,7 @@
     Processes dumps in the current directory at maximum speed by skipping offsets.
 #>
 
+[CmdletBinding()]
 Param(
   [Parameter(Mandatory = $true)]
   [string]$DumpDir,
@@ -53,7 +54,7 @@ Param(
 
   [bool]$ShowOffsets = $true,
 
-  [bool]$KeepFullStrings = $true,
+  [bool]$KeepFullStrings = $false,
 
   [int]$ThrottleLimit = 12,
 
@@ -78,6 +79,8 @@ $Needles = @(
 if (Test-Path $DumpDir) { $DumpDir = (Resolve-Path $DumpDir).Path }
 else { throw "Dump directory '$DumpDir' not found." }
 
+Write-Verbose "Resolved DumpDir: $DumpDir"
+
 $OutDir = if (Test-Path $OutDir) { (Resolve-Path $OutDir).Path } else { [System.IO.Path]::GetFullPath($OutDir) }
 
 $RawDir = Join-Path $OutDir "raw_full_strings"
@@ -100,11 +103,11 @@ if ($KeepFullStrings) { $null = New-Item -ItemType Directory -Force -Path $RawDi
 
 # --------------------------- VALIDATE TOOLS ---------------------------
 if (-not (Test-Path $StringsExe)) {
-  $found = (Get-Command $StringsExe -ErrorAction SilentlyContinue).Source
-  if ($null -eq $found) {
+  $cmd = Get-Command $StringsExe -ErrorAction SilentlyContinue
+  if ($null -eq $cmd) {
     throw "strings64.exe not found at '$StringsExe' and not in PATH. Please download it from Sysinternals."
   }
-  $StringsExe = $found
+  $StringsExe = $cmd.Source
 }
 
 # --------------------------- SCAN DUMPS ---------------------------
@@ -129,13 +132,22 @@ Write-Host "Show Offsets: $ShowOffsets" -ForegroundColor $(if ($ShowOffsets) { "
 
 # --------------------------- RUN PARALLEL AS JOBS ---------------------------
 
-$jobs = foreach ($Dump in $dumps) {
+$jobs = @()
+foreach ($Dump in $dumps) {
+  if ($jobs.Count -gt 0) {
+    while (@($jobs | Get-Job | Where-Object { $_.State -eq 'Running' }).Count -ge $ThrottleLimit) {
+      Start-Sleep -Milliseconds 500
+    }
+  }
+
   $base = $Dump.BaseName
   $statusFile = Join-Path $StatusDir "$base.json"
   
-  Start-Job -Name "Carve_$base" -ScriptBlock {
-    param($dumpName, $dumpFullName, $StringsExe, $MinLen, $Needles, $ScanUnicode, $KeepFullStrings, $OutDir, $RawDir, $PerDumpCsvDir, $PerDumpPathDir, $PythonHitsTxtDir, $StatusDir, $statusFile, $ShowOffsets)
+  $job = Start-Job -Name "Carve_$base" -ScriptBlock {
+    param($dumpName, $dumpFullName, $StringsExe, $MinLen, $Needles, $ScanUnicode, $KeepFullStrings, $OutDir, $RawDir, $PerDumpCsvDir, $PerDumpPathDir, $PythonHitsTxtDir, $StatusDir, $statusFile, $ShowOffsets, $VerbosePref, $DebugPref)
     
+    $VerbosePreference = $VerbosePref
+    $DebugPreference = $DebugPref
     Set-StrictMode -Version Latest
     $ErrorActionPreference = "Stop"
 
@@ -163,6 +175,21 @@ $jobs = foreach ($Dump in $dumps) {
       $status | ConvertTo-Json -Compress | Out-File -FilePath $statusFile -Encoding UTF8 -Force
     }
 
+    function Write-JobLog([string]$msg, [string]$level = "INFO") {
+      $logFile = Join-Path $StatusDir "$base.log"
+      $ts = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
+      
+      $shouldWrite = $true
+      if ($level -eq "VERBOSE" -and $VerbosePreference -eq "SilentlyContinue") { $shouldWrite = $false }
+      if ($level -eq "DEBUG" -and $DebugPreference -eq "SilentlyContinue") { $shouldWrite = $false }
+
+      if ($shouldWrite) {
+        "[$ts] [$level] $msg" | Out-File $logFile -Append -Encoding UTF8
+      }
+      if ($level -eq "VERBOSE") { Write-Verbose $msg }
+      elseif ($level -eq "DEBUG") { Write-Debug $msg }
+    }
+
     $base = [System.IO.Path]::GetFileNameWithoutExtension($dumpName)
     $fullPath = $dumpFullName
 
@@ -173,13 +200,14 @@ $jobs = foreach ($Dump in $dumps) {
     # Pre-compile combined needle regex for massive performance gain
     $needlePattern = ($Needles | ForEach-Object { [regex]::Escape($_) }) -join '|'
     $rxNeedle = [regex]("(?i)($needlePattern)")
+    $findstrNeedles = $Needles -join ' '
     
     $paths = New-Object System.Collections.Generic.HashSet[string]
     $totalHits = 0
     $taskStartTime = Get-Date
 
-    $rxLinuxPy = [regex]'(?i)(/[^ \t\r\n"''<>|]+?\.py)\b'
-    $rxWinPy = [regex]'(?i)\b([A-Z]:\\[^ \t\r\n"''<>|]+?\.py)\b'
+    $rxLinuxPy = [regex]"(?i)(/[^ \t\r\n`"`'<>|*?:]*?(?:$needlePattern)[^ \t\r\n`"`'<>|*?:]*)"
+    $rxWinPy = [regex]"(?i)\b([A-Z]:\\[^ \t\r\n`"`'<>|*?]*?(?:$needlePattern)[^ \t\r\n`"`'<>|*?]*)"
 
     $csvWriter = New-Object System.IO.StreamWriter($dumpCsv, $false, [System.Text.Encoding]::UTF8)
     $txtWriter = New-Object System.IO.StreamWriter($pyHitsTxt, $false, [System.Text.Encoding]::UTF8)
@@ -204,15 +232,23 @@ $jobs = foreach ($Dump in $dumps) {
         Update-Status "strings_$($encName.ToLower())"
 
         $psi = New-Object System.Diagnostics.ProcessStartInfo
-        $psi.FileName = $StringsExe
-        # -o is slow; only add if requested
-        $args = "-nobanner $encArg " + $(if ($ShowOffsets) { "-o " } else { "" }) + "-n $MinLen ""$fullPath"""
-        $psi.Arguments = $args
+        $stringsCmd = "`"$StringsExe`" -nobanner $encArg " + $(if ($ShowOffsets) { "-o " } else { "" }) + "-n $MinLen `"$fullPath`""
+        
+        if (-not $KeepFullStrings) {
+          $psi.FileName = "cmd.exe"
+          $psi.Arguments = "/c `"$stringsCmd | findstr /I /L `"$findstrNeedles`"`""
+        }
+        else {
+          $psi.FileName = $StringsExe
+          $psi.Arguments = "-nobanner $encArg " + $(if ($ShowOffsets) { "-o " } else { "" }) + "-n $MinLen `"$fullPath`""
+        }
+        
         $psi.UseShellExecute = $false
         $psi.RedirectStandardOutput = $true
         $psi.CreateNoWindow = $true
 
         $proc = [System.Diagnostics.Process]::Start($psi)
+        Write-JobLog "Started strings extraction with encoding $encName (PID: $($proc.Id))" "VERBOSE"
         
         while (-not $proc.StandardOutput.EndOfStream) {
           $line = $proc.StandardOutput.ReadLine()
@@ -255,6 +291,14 @@ $jobs = foreach ($Dump in $dumps) {
         $proc.WaitForExit()
       }
     }
+    catch {
+      $errorMsg = $_.Exception.Message
+      $errorLog = Join-Path $OutDir "errors.log"
+      $errMsg = "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] ERROR on dump '$dumpName': $errorMsg"
+      $errMsg | Out-File $errorLog -Append -Encoding UTF8
+      Write-JobLog "Job failed: $errorMsg" "DEBUG"
+      Update-Status "failed" 0
+    }
     finally {
       if ($null -ne $csvWriter) { $csvWriter.Dispose() }
       if ($null -ne $txtWriter) { $txtWriter.Dispose() }
@@ -272,12 +316,14 @@ $jobs = foreach ($Dump in $dumps) {
       PerDumpPathsTxt = $pathsTxt
       PythonHitsTxt   = $pyHitsTxt
     }
-  } -ArgumentList $Dump.Name, $Dump.FullName, $StringsExe, $MinLen, $Needles, $ScanUnicode, $KeepFullStrings, $OutDir, $RawDir, $PerDumpCsvDir, $PerDumpPathDir, $PythonHitsTxtDir, $StatusDir, $statusFile, $ShowOffsets
+  } -ArgumentList $Dump.Name, $Dump.FullName, $StringsExe, $MinLen, $Needles, $ScanUnicode, $KeepFullStrings, $OutDir, $RawDir, $PerDumpCsvDir, $PerDumpPathDir, $PythonHitsTxtDir, $StatusDir, $statusFile, $ShowOffsets, $VerbosePreference, $DebugPreference
+  $jobs += $job
 }
 
 # --------------------------- PROGRESS LOOP (ETA + Running Names + Phases + Avg) ---------------------------
 while ($true) {
-  $completedNow = @($jobs | Get-Job | Where-Object { $_.State -in @("Completed", "Failed", "Stopped") }).Count
+  $currentJobs = $jobs | Get-Job
+  $completedNow = @($currentJobs | Where-Object { $_.State -in @("Completed", "Failed", "Stopped") }).Count
   $percent = if ($totalDumps -gt 0) { [int](($completedNow / $totalDumps) * 100) } else { 0 }
 
   $runningInfo = @()
@@ -302,7 +348,7 @@ while ($true) {
   }
 
   $avgMin = 0
-  $etaSeconds = 0
+  $etaSeconds = -1
   if ($durations.Count -gt 0) {
     $avgSec = ($durations | Measure-Object -Average).Average
     $avgMin = [math]::Round($avgSec / 60, 1)
@@ -333,11 +379,7 @@ while ($true) {
     -PercentComplete $percent `
     -SecondsRemaining $etaSeconds
 
-  $allFinished = $true
-  foreach ($j in $jobs) {
-    if ($j.State -notin @("Completed", "Failed", "Stopped")) { $allFinished = $false; break }
-  }
-  if ($allFinished) { break }
+  if ($completedNow -ge $totalDumps) { break }
   Start-Sleep -Seconds 2
 }
 
@@ -354,30 +396,55 @@ function ConvertTo-CsvValue-Main([string]$s) {
   return '"' + ($s -replace '"', '""') + '"'
 }
 
-"DumpFile,Encoding,Offset,OffsetText,String" | Out-File -FilePath $AllStringsCsv -Encoding UTF8 -Force
-Get-ChildItem -Path $PerDumpCsvDir -Filter *.csv -File | ForEach-Object {
-  Get-Content $_.FullName | Select-Object -Skip 1 | Add-Content -Path $AllStringsCsv -Encoding UTF8
+try {
+  $strWriter = New-Object System.IO.StreamWriter($AllStringsCsv, $false, [System.Text.Encoding]::UTF8)
+  $strWriter.WriteLine("DumpFile,Encoding,Offset,OffsetText,String")
+  foreach ($csvFile in (Get-ChildItem -Path $PerDumpCsvDir -Filter *.csv -File)) {
+    $reader = New-Object System.IO.StreamReader($csvFile.FullName, [System.Text.Encoding]::UTF8)
+    # Skip header
+    if (-not $reader.EndOfStream) { $null = $reader.ReadLine() }
+    while (-not $reader.EndOfStream) {
+      $strWriter.WriteLine($reader.ReadLine())
+    }
+    $reader.Dispose()
+  }
+}
+finally {
+  if ($null -ne $strWriter) { $strWriter.Dispose() }
 }
 
-"DumpFile,PyPath" | Out-File -FilePath $AllPathsCsv -Encoding UTF8 -Force
-
-# Safety: Disable strict mode for the merge to handle deserialized objects gracefully
-Set-StrictMode -Off
-foreach ($r in @($results)) {
-  if ($null -ne $r) {
-    if (Test-Path $r.PerDumpPathsTxt) {
-      Get-Content $r.PerDumpPathsTxt | ForEach-Object {
-        $p = $_
-        if (-not [string]::IsNullOrWhiteSpace($p)) {
-          (ConvertTo-CsvValue-Main $r.DumpFile) + "," + (ConvertTo-CsvValue-Main $p) | Add-Content -Path $AllPathsCsv -Encoding UTF8
+try {
+  $pathWriter = New-Object System.IO.StreamWriter($AllPathsCsv, $false, [System.Text.Encoding]::UTF8)
+  $pathWriter.WriteLine("DumpFile,PyPath")
+  
+  # Safety: Disable strict mode for the merge to handle deserialized objects gracefully
+  Set-StrictMode -Off
+  foreach ($r in @($results)) {
+    if ($null -ne $r) {
+      if (Test-Path $r.PerDumpPathsTxt) {
+        $reader = New-Object System.IO.StreamReader($r.PerDumpPathsTxt, [System.Text.Encoding]::UTF8)
+        while (-not $reader.EndOfStream) {
+          $p = $reader.ReadLine()
+          if (-not [string]::IsNullOrWhiteSpace($p)) {
+            $pathWriter.WriteLine((ConvertTo-CsvValue-Main $r.DumpFile) + "," + (ConvertTo-CsvValue-Main $p))
+          }
         }
+        $reader.Dispose()
       }
     }
   }
+  Set-StrictMode -Version Latest
 }
-Set-StrictMode -Version Latest
+finally {
+  if ($null -ne $pathWriter) { $pathWriter.Dispose() }
+}
+
 
 $results | Export-Csv -Path $SummaryCsv -NoTypeInformation -Encoding UTF8
+
+# Cleanup jobs to free PowerShell host memory
+Write-Host "[+] Cleaning up background jobs..." -ForegroundColor Cyan
+$jobs | Remove-Job -Force
 
 Write-Host "DONE ✅" -ForegroundColor Green
 Write-Host "All strings CSV : $AllStringsCsv"
